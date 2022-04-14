@@ -1,0 +1,328 @@
+---
+title: "Essai différence H/H"
+author: "Franck LE MAT"
+date: "24/01/2022"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(data.table)
+library(funModeling)
+library(pander)
+library(scales)
+library(lme4)
+library(car)
+library(fitdistrplus)
+library(mgcv)
+library(MASS)
+library(ggsci)
+library(caTools)
+library(glmmTMB)
+library(Metrics)
+library(MuMIn)
+
+######################
+## Dataset load 
+######################
+
+setwd("~/Project _dataScience/UTMB_dataMining/3. Analysis/")
+race_result <- fread('DRV_result.csv')
+
+#select_coureur_relatif <- fread('3. MLM_fitting/pair_MLM_4%_unique.csv')
+select_coureur_absolue <- fread('3. MLM_fitting/pair_MLM_60s_unique.csv')
+
+######################
+## Variable encoding
+######################
+
+df <- inner_join(race_result,
+                 select_coureur_absolue,
+                 by = c("id_course_annee", "id_coureur"))
+
+df <- df %>%
+  group_by(id_coureur,annee) %>%
+  mutate(id_coureur_annee = cur_group_id()) %>%
+  ungroup() %>%
+  transform(id_coureur_annee = as.factor(id_coureur_annee),
+            id_course_annee = as.factor(id_course_annee),
+            id_pair = as.factor(id_pair),
+            sexe = as.factor(sexe))
+
+
+class_building <- function(x){
+  
+  # We select 'short' distance race, meaning race from 25 to 45 km effort
+  df_rank <- x %>%
+    filter(km_effort >= 25 & km_effort <= 45) %>%
+    group_by(id_pair) %>%
+    summarise(vitesse_moy_kmE = mean(km_effort)/mean(temps_s/3600), 
+              vitesse_moy = mean(vitesse_moy), 
+              km_effort = mean(km_effort))
+  
+  # We create a linear model with those race's speed 
+  l_model <- lm(vitesse_moy_kmE ~ km_effort, data = df_rank)
+  
+  # We adjust the speed in function of the beta coefficient of the linear model
+  rank <- df_rank %>% 
+    mutate(vitesse_moy_adj = (l_model$coefficients[2]
+                              * (km_effort - min(km_effort)))
+           + vitesse_moy_kmE)
+  
+  # We calculate the quartile of the adjuted speed.
+  # Each quartile represent a level classification 
+  rank <- rank %>%
+    mutate(class = cut(x = vitesse_moy_adj, 
+                       breaks = quantile(rank$vitesse_moy_adj,
+                                         probs = seq(0, 1, 1/4)), 
+                       labels = c("Q4", "Q3", "Q2", "Q1"), 
+                       include.lowest = TRUE)) %>%
+    dplyr::select("id_pair", "class") %>%
+    distinct()
+  
+  x <- x %>%
+    inner_join(rank, by = "id_pair")
+  return(x)
+}
+
+df <- class_building(df)
+
+hist(log(df$vitesse_moy))
+
+df_diff <- df %>%
+  group_by(id_pair,id_course_annee) %>%
+  summarise(km_effort = mean(km_effort, na.rm = TRUE),
+            y_diff = vitesse_moy[sexe == 'H'] -  vitesse_moy[sexe == 'F']) %>%
+  mutate(y_diff_rel = (max(y_diff) - y_diff) / (max(y_diff) - min(y_diff)) ) %>%
+  ungroup()
+
+
+df_class <- df %>% dplyr::select('id_pair', 'class') %>% unique()
+
+df_diff <- df_diff %>%
+  inner_join(df_class, by = 'id_pair')
+```
+
+## Evaluation de la distribution de la variable Y
+
+Y est la différence entre la vitesse Homme et la vitesse Femme sur une course données. Soit y_diff = Vitesse_H - Vitesse_F
+
+```{r vis}
+
+ggplot(df_diff,
+       aes(x = km_effort,
+           y = y_diff_rel)) +
+  geom_point(alpha = .5,
+             size = 1) +
+  scale_x_continuous(breaks =  breaks_pretty()) +
+  scale_y_continuous(breaks = breaks_pretty()) +
+  scale_color_lancet()+
+  labs(y = "Speed difference (km/h)", 
+       x = "km effort (a.u.)", 
+       title = "Selected pair using absolute speed") +
+  theme_classic() + 
+  facet_wrap(~class) 
+  geom_point(data = data.frame(x = 35, y = 0),
+             aes(x, y),
+             size = 15,
+             pch = 1, 
+             color = 'red') 
+```
+A ce stade déjà pour moi il y a un problème. On peut voir l'écrasement des données (cercle rouge) au niveau des distances pour lesquelles la selection a été faite. Il me semble apriori que cela est un problème. L'est il vraiment ? 
+
+### Visualisation de la distribution de y_diff
+```{r plot dist}
+df_diff <- df_diff %>%
+  mutate(y_scaled = sign(y_diff_rel) * abs(y_diff_rel)^(1/2))
+
+plotdist(df_diff$y_diff_rel)
+
+```
+On peut observer que la distribution semble normal avec cependant un large positif kurtosis. Toujours du à la selection des paires. 
+
+
+**Cullen and Frey graph to evaluate the distribution**
+```{r plot dist2}
+descdist(df_diff$y_scaled, boot = 100) 
+
+```
+Le graphique Cullen and Frey avec un bootstrapping de 100 ne permet pas d'identifier clairement la distribution de la varibale y_diff. 
+
+Pour continuer la modélisation, je vais considérer que la distribution est normale.
+
+## Modélisation 
+
+### Random effect selection
+
+We first selected the random effect as suggested by Zuur and al. (2009). 
+
+```{r random}
+model1 <- glmmTMB(y_scaled ~ km_effort*class
+                 + (1 | id_pair),
+                 data = df_diff,
+                 family=gaussian(),
+                 control = glmmTMBControl(parallel = 7))
+
+model2 <- glmmTMB(y_scaled ~ km_effort*class
+                  + (1|id_course_annee),
+                  data = df_diff, 
+                  family=gaussian(), 
+                  control = glmmTMBControl(parallel = 7))
+
+model3 <- glmmTMB(y_scaled ~ km_effort*class
+                  + (1 | id_pair)
+                  + (1|id_course_annee),
+                  data = df_diff, 
+                  family=gaussian(), 
+                  control = glmmTMBControl(parallel = 7))
+
+model4 <- glmmTMB(y_scaled ~ km_effort*class
+                  + (1 + km_effort | id_pair)
+                  + (1|id_course_annee),
+                  data = df_diff, 
+                  family=gaussian(), 
+                  control = glmmTMBControl(parallel = 7))
+
+
+
+AIC(model1, model2, model3, model4)
+
+summary(model4)
+
+```
+Le modèle avec l'AIC le plus bas est le modèle 'model4'. 
+
+### Fixed effect selection
+
+Evaluation des effets fixes. 
+
+```{r fixed}
+library(parallel)
+
+clusterType <- if(length(find.package("snow", quiet = TRUE))) "SOCK" else "PSOCK"
+clust <- try(makeCluster(getOption("cl.cores", 7), type = clusterType))
+
+clusterExport(clust, c("glmmTMB",
+                       'glmmTMBControl',
+                       'df_diff'))
+invisible(clusterCall(clust,
+                      "library",
+                      "stats4",
+                      character.only = TRUE))
+
+options(na.action = "na.fail")
+model_dredge <- MuMIn::pdredge(cluster = clust,
+                               global.model = model4,
+                               rank = "AIC")
+
+stopCluster(clust)
+
+print(model_dredge)
+
+
+```
+Le modèle avec tous les effect fixes est celui avec l'AIC le plus bas. 
+Donc je fais l'évaluation du moddèle sur :  y_diff ~ km_effort * class + (1 | id_pair) +  (1 | id_course_annee),
+
+## Evaluation du modèle 
+
+### Fit vs Residuals
+```{r eval, echo = FALSE}
+df_res <- df_diff %>%
+  mutate(fit = fitted(model4), 
+         res = residuals(model4), 
+         cat = ifelse(km_effort >= 45 | km_effort < 25, 'long', 'court'))
+
+ggplot(data = df_res,
+       aes(x = fit,
+           y = res,
+           color = cat)) + 
+  geom_point(alpha = .5)
+
+```
+On peut voir sur ce graph fit vs residuals une forte heteroskedascité. Avec la non normalité des résultats, cela est mon plus gros souci avec l'utilisation de cette méthodologie. **Est ce justifié ?**
+J'ai l'impression que le modèle privilègie les résultats sur les course courtes que sur les courses longues (voir couleur sur le graph).
+
+### DHARMa
+```{r eval2}
+library(DHARMa)
+simulationOutput <- simulateResiduals(fittedModel = model4, plot = F)
+
+plot(simulationOutput)
+
+testDispersion(simulationOutput)
+
+testOutliers(simulationOutput)
+
+```
+
+Les résultats de l'analyse avec le package DHARMa semblent eux plutôt correct. 
+
+
+##Visualisation des résultats
+
+Il est vrai dans ce cas là que l'interprétation des résultats est beaucoup plus facile. Voilà les intervalles de confiance ainsi que les graphiques des effets marginaux sur km effort et c=le niveau. 
+
+### Marginal effect
+
+
+```{r result viz}
+library(ggeffects)
+mydf <- ggpredict(model4,
+                  terms = c("km_effort"))
+
+ggplot(mydf,
+       aes(x,
+           predicted)) +
+  geom_line() +
+  geom_ribbon(aes(ymin = conf.low,
+                  ymax = conf.high), 
+              alpha = .1,
+              show.legend=FALSE) + 
+  geom_hline(yintercept = 0, linetype = 'dotted') + 
+  labs(
+    y = "Speed difference (km/h)",
+    x = "km effort (a.u.)",
+    colour = "Gender",
+    title = "Marginal effect of km effort on speed difference"
+  ) +
+  scale_x_continuous(breaks = pretty_breaks()) + 
+  scale_y_continuous(breaks = pretty_breaks()) +
+  scale_fill_lancet() +
+  scale_color_lancet() +
+  theme_classic() 
+
+```
+
+```{r result viz2}
+library(ggeffects)
+mydf <- ggpredict(model3,
+                  terms = c("km_effort", "class"))
+
+ggplot(mydf,
+       aes(x,
+           predicted)) +
+  geom_line(aes(colour = group)) +
+  geom_ribbon(aes(ymin = conf.low,
+                  ymax = conf.high,
+                  fill = group),
+              alpha = .1,
+              show.legend=FALSE) + 
+  geom_hline(yintercept = 0, linetype = 'dotted') + 
+  labs(
+    y = "Speed differene (km/h)",
+    x = "km effort (a.u.)",
+    colour = "Level",
+    title = "Marginal effect of km effort and level on speed difference"
+  ) +
+  scale_x_continuous(breaks = pretty_breaks()) + 
+  scale_y_continuous(breaks = pretty_breaks()) +
+  scale_color_lancet() +
+  scale_fill_lancet() +
+  theme_classic() + 
+  facet_wrap(~group)
+
+```
+
