@@ -4,12 +4,6 @@
 
 3. MLM_fitting script et visualisation de sélection, ajustement et analyse de résultats du modèle GLMM
 
-graph_fred - script de graph pour Fred
-
-graph_Gui - script de graph pour Gui
-
-visualisation - data viz de l'analyse general des données
-
 DRV_info_course.csv - unité une course sur une année
 	- id_course_annee - clé primaire
 	- rate_DNF_M - pourcentage de DNF homme
